@@ -31,7 +31,7 @@
 
 OBSのスクリプト機能はPython 3.10が必要です。
 
-[https://www.python.org/downloads/release/python-3100/](https://www.python.org/downloads/release/python-31020/)
+https://www.python.org/downloads/release/python-31020/
 
 ### 2. pywin32をインストール
 
