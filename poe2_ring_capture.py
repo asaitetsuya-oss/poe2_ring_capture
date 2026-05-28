@@ -28,6 +28,11 @@ import zlib
 import re
 import os
 
+# ④ トップレベルに移動
+import win32gui
+import win32ui
+import win32con
+
 # ─────────────────────────────────────────
 # 解像度別プリセット座標
 # (ring_x, ring_y, cap_left, cap_top, cap_right, cap_bottom)
@@ -57,16 +62,20 @@ log_path       = ""
 scene_delay    = 0
 
 COOLDOWN_SEC   = 2.0
-key_delay      = 0.3   # K押してから画面が開くまで(秒)
-hover_delay    = 0.4   # カーソル移動してからUI表示まで(秒)
+key_delay      = 0.3
+hover_delay    = 0.4
 AUTO_COOLDOWN  = 20
 
 _cooldown      = 0
-_processing    = False
 _hotkey_id     = obs.OBS_INVALID_HOTKEY_ID
 _last_auto_cap = 0
 _last_pos      = 0
-_watching      = False
+
+# ② threading.Lock でスレッドセーフ化
+_processing_lock = threading.Lock()
+
+# ⑤ threading.Event でウォッチャー停止を即時反映
+_stop_event    = threading.Event()
 _watch_thread  = None
 
 # ─────────────────────────────────────────
@@ -220,7 +229,6 @@ VK_K = 0x4B
 # キャプチャ・PNG保存
 # ─────────────────────────────────────────
 def capture_region():
-    import win32gui, win32ui, win32con
     w = cap_right  - cap_left
     h = cap_bottom - cap_top
     hdesktop   = win32gui.GetDesktopWindow()
@@ -228,14 +236,17 @@ def capture_region():
     hdc    = win32ui.CreateDCFromHandle(hdesktopdc)
     memdc  = hdc.CreateCompatibleDC()
     bitmap = win32ui.CreateBitmap()
-    bitmap.CreateCompatibleBitmap(hdc, w, h)
-    memdc.SelectObject(bitmap)
-    memdc.BitBlt((0,0), (w,h), hdc, (cap_left, cap_top), win32con.SRCCOPY)
-    bmpstr = bitmap.GetBitmapBits(True)
-    win32gui.DeleteObject(bitmap.GetHandle())
-    memdc.DeleteDC()
-    hdc.DeleteDC()
-    win32gui.ReleaseDC(hdesktop, hdesktopdc)
+    try:
+        # ③ try/finally でDCリソースを確実にリリース
+        bitmap.CreateCompatibleBitmap(hdc, w, h)
+        memdc.SelectObject(bitmap)
+        memdc.BitBlt((0, 0), (w, h), hdc, (cap_left, cap_top), win32con.SRCCOPY)
+        bmpstr = bitmap.GetBitmapBits(True)
+    finally:
+        win32gui.DeleteObject(bitmap.GetHandle())
+        memdc.DeleteDC()
+        hdc.DeleteDC()
+        win32gui.ReleaseDC(hdesktop, hdesktopdc)
     return w, h, bmpstr
 
 def save_png(w, h, rgba_bytes, path):
@@ -245,7 +256,7 @@ def save_png(w, h, rgba_bytes, path):
     raw = bytearray()
     for y in range(h):
         raw.append(0)
-        raw.extend(rgba_bytes[y*w*4:(y+1)*w*4])
+        raw.extend(rgba_bytes[y * w * 4:(y + 1) * w * 4])
     with open(path, 'wb') as f:
         f.write(b'\x89PNG\r\n\x1a\n')
         f.write(chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)))
@@ -253,24 +264,41 @@ def save_png(w, h, rgba_bytes, path):
         f.write(chunk(b'IEND', b''))
 
 # ─────────────────────────────────────────
+# ① ピクセル処理: bytearray一括変換
+# BGRAバイト列をRGBAに並び替えつつ暗色を透明化する
+# ─────────────────────────────────────────
+def _build_rgba(bmpstr, w, h, thresh):
+    src = bytearray(bmpstr)          # BGRAx(w*h)
+    dst = bytearray(w * h * 4)
+    for i in range(w * h):
+        o = i * 4
+        b, g, r = src[o], src[o + 1], src[o + 2]
+        dst[o]     = r
+        dst[o + 1] = g
+        dst[o + 2] = b
+        dst[o + 3] = 0 if (r + g + b) < thresh else 255
+    return bytes(dst)
+
+# ─────────────────────────────────────────
 # メイン処理
 # ─────────────────────────────────────────
 def process_capture():
-    global _processing, _cooldown
+    global _cooldown
     now = time.time()
-    if _processing or now < _cooldown:
+    if now < _cooldown:
         return
-    if not is_allowed_scene():
-        obs.script_log(obs.LOG_INFO, "[RingCapture] シーンが違うためスキップ")
+    # ② Lock で二重実行を確実に防ぐ
+    if not _processing_lock.acquire(blocking=False):
         return
-    if not output_path:
-        obs.script_log(obs.LOG_WARNING, "[RingCapture] 出力パスが未設定")
-        return
-
-    _processing = True
-    _cooldown   = now + COOLDOWN_SEC
-
     try:
+        if not is_allowed_scene():
+            obs.script_log(obs.LOG_INFO, "[RingCapture] シーンが違うためスキップ")
+            return
+        if not output_path:
+            obs.script_log(obs.LOG_WARNING, "[RingCapture] 出力パスが未設定")
+            return
+
+        _cooldown = now + COOLDOWN_SEC
         orig_x, orig_y = get_cursor_pos()
 
         send_key(VK_K, down=True)
@@ -286,19 +314,8 @@ def process_capture():
         send_key(VK_K, down=False)
         move_mouse(orig_x, orig_y)
 
-        pixels_in  = struct.unpack(f'{w*h*4}B', bmpstr)
-        pixels_out = bytearray(w * h * 4)
-        for i in range(w * h):
-            b = pixels_in[i*4]
-            g = pixels_in[i*4+1]
-            r = pixels_in[i*4+2]
-            a = 0 if (r + g + b) < dark_thresh else 255
-            pixels_out[i*4]   = r
-            pixels_out[i*4+1] = g
-            pixels_out[i*4+2] = b
-            pixels_out[i*4+3] = a
-
-        save_png(w, h, bytes(pixels_out), output_path)
+        rgba = _build_rgba(bmpstr, w, h, dark_thresh)
+        save_png(w, h, rgba, output_path)
         obs.script_log(obs.LOG_INFO, f"[RingCapture] 保存完了: {output_path}")
 
     except Exception as e:
@@ -306,7 +323,7 @@ def process_capture():
         import traceback
         obs.script_log(obs.LOG_ERROR, traceback.format_exc())
     finally:
-        _processing = False
+        _processing_lock.release()
 
 # ─────────────────────────────────────────
 # Client.txt 監視
@@ -319,8 +336,8 @@ def restart_watcher():
         obs.script_log(obs.LOG_WARNING, f"[RingCapture] Client.txt が見つかりません: {log_path}")
 
 def start_watcher():
-    global _watching, _watch_thread, _last_pos
-    _watching = True
+    global _watch_thread, _last_pos
+    _stop_event.clear()
     try:
         _last_pos = os.path.getsize(log_path)
     except OSError:
@@ -330,12 +347,12 @@ def start_watcher():
     obs.script_log(obs.LOG_INFO, f"[RingCapture] ログ監視開始: {log_path}")
 
 def stop_watcher():
-    global _watching
-    _watching = False
+    # ⑤ Event.set() で即時停止シグナル
+    _stop_event.set()
 
 def _watch_loop():
     global _last_pos
-    while _watching:
+    while not _stop_event.wait(timeout=1.0):   # ⑤ sleep の代わりに wait
         try:
             size = os.path.getsize(log_path)
             if size > _last_pos:
@@ -346,7 +363,6 @@ def _watch_loop():
                 _check_scene_change(new_text)
         except OSError:
             pass
-        time.sleep(1.0)
 
 def _check_scene_change(text):
     matches = re.findall(r'\[SCENE\] Set Source \[(.+?)\]', text)
